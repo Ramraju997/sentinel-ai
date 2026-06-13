@@ -68,6 +68,67 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
   );
 }
 
+function getApiUrl(port = 8000): string {
+  if (typeof window === "undefined") return `http://localhost:${port}`;
+  
+  if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
+    return `http://localhost:${port}`;
+  }
+
+  // Under AMD Notebooks proxy, path is /<pod-name>/proxy/<port>/
+  const match = window.location.pathname.match(/^\/([^/]+)\/proxy\/\d+/);
+  if (match) {
+    const podName = match[1];
+    return `/${podName}/proxy/${port}`;
+  }
+
+  return `http://localhost:${port}`;
+}
+
+async function fetchvLLMResponse(text: string, history: ChatMessage[]): Promise<string> {
+  const apiBase = getApiUrl(8000);
+  const endpoint = `${apiBase}/v1/chat/completions`;
+
+  // Format messages into OpenAI/vLLM format
+  const formattedMessages = history
+    .map((msg) => ({
+      role: msg.role === "assistant" ? "assistant" : "user",
+      content: msg.content,
+    }))
+    .concat({ role: "user", content: text });
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15-second timeout
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "Qwen/Qwen2-7B-Instruct",
+        messages: formattedMessages,
+        temperature: 0.7,
+        max_tokens: 512,
+      }),
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || "No response content from model.";
+  } catch (error) {
+    console.warn("Failed to contact vLLM inference server. Falling back to local mock response.", error);
+    return getResponse(text);
+  }
+}
+
 export function AIChatPanel() {
   const [messages, setMessages] = useState<ChatMessage[]>(initialChatMessages);
   const [input, setInput] = useState("");
@@ -78,7 +139,7 @@ export function AIChatPanel() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  function sendMessage(text: string) {
+  async function sendMessage(text: string) {
     if (!text.trim() || loading) return;
     const now = new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
 
@@ -88,11 +149,22 @@ export function AIChatPanel() {
       content: text,
       timestamp: now,
     };
-    setMessages((prev) => [...prev, userMsg]);
+    
+    const updatedMessages = [...messages, userMsg];
+    setMessages(updatedMessages);
     setInput("");
     setLoading(true);
 
-    setTimeout(() => {
+    try {
+      const responseText = await fetchvLLMResponse(text, messages);
+      const aiMsg: ChatMessage = {
+        id: `a${Date.now()}`,
+        role: "assistant",
+        content: responseText,
+        timestamp: new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }),
+      };
+      setMessages((prev) => [...prev, aiMsg]);
+    } catch (err) {
       const aiMsg: ChatMessage = {
         id: `a${Date.now()}`,
         role: "assistant",
@@ -100,8 +172,9 @@ export function AIChatPanel() {
         timestamp: new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }),
       };
       setMessages((prev) => [...prev, aiMsg]);
+    } finally {
       setLoading(false);
-    }, 1200);
+    }
   }
 
   return (
